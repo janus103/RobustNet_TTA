@@ -68,7 +68,10 @@ __C.STRICTBORDERCLASS = None
 #Attribute Dictionary for Dataset
 __C.DATASET = AttrDict()
 #Cityscapes Dir Location
-__C.DATASET.CITYSCAPES_DIR = '/root/jin/data/cityscapes'
+
+ORIGINAL_CITYSCAPES= '/home/oem/servers/datasets/segmentation/data/davian/segmentation/cityscapes'
+
+__C.DATASET.CITYSCAPES_DIR = ORIGINAL_CITYSCAPES#'/root/jin/data/cityscapes'
 #SDC Augmented Cityscapes Dir Location
 __C.DATASET.CITYSCAPES_AUG_DIR = ''
 #Mapillary Dataset Dir Location

@@ -35,6 +35,83 @@ from network.mynn import initialize_weights, Norm2d, Upsample, freeze_weights, u
 
 import torchvision.models as models
 
+import torch_dwt as tdwt
+
+class SEModule(nn.Module):
+
+    def __init__(self, channels=64, reduction_=1, dwt_level=2):
+        super(SEModule, self).__init__()
+        
+        reduction = int(reduction_ // 10)
+        mean_true = int(reduction_ % 10)
+
+        print(f'Reduction: {reduction} GT_OPTION: {mean_true}')
+
+        if mean_true == 0:
+            self.gt_lst = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5] # ALL Median
+        elif mean_true == 1: 
+            self.gt_lst = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0] # All Highest
+        elif mean_true == 2:
+            self.gt_lst = [1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7] # All Lowest
+        elif mean_true == 3:
+            self.gt_lst = [1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 0.5, 1e-7, 1.0, 0.5, 0.5, 1e-7, 1.0, 1e-7, 1e-7, 1e-7] # LL is More Important
+        elif mean_true == 4:
+            self.gt_lst = [1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 0.5, 0.5, 1.0, 1e-7, 0.5, 0.5, 1.0, 1e-7, 1.0, 1.0, 1.0] # HH is More Important
+            
+
+        self.fc1 = nn.Conv2d(channels, channels // reduction, kernel_size=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Conv2d(channels // reduction, (channels * 2), kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+
+        if dwt_level == 1:
+            self.frequency_name = {'0':'LL', '1':'LL', '2':'LL', '3':'LL'}
+        elif dwt_level == 2:
+            self.frequency_name = {'0':'LL_LL', '1':'LL_LH', '2':'LL_HL', '3':'LL_HH', '4':'LH_LL', '5':'LH_LH', '6':'LH_HL', '7':'LH_HH', '8':'HL_LL', '9':'HL_LH', '10':'HL_HL', '11':'HL_HH', '12':'HH_LL', '13':'HH_LH', '14':'HH_HL', '15':'HH_HH'}
+        
+
+    def adaptive_std(self, std):
+        threshold = 0.9
+        valid_std_mask = std >= threshold
+        
+        std = (std * valid_std_mask) + 1e-9
+        
+        gt_lst = torch.ones((128, 64, 1, 1)).cuda()
+        gt_lst = (gt_lst * valid_std_mask) + 1e-9
+
+        return std, gt_lst
+
+
+    def forward(self, x, frequency_index, gt_lst=None):
+        module_input = x
+        x = x.mean((2, 3), keepdim=True)
+        x = self.fc1(x) # Excitation
+        x = self.relu(x)
+        x = self.fc2(x) # scaling 
+        x = self.sigmoid(x)
+
+        mean = x[:, ::2]  # 모든 배치의 짝수 위치 (평균)
+        std = x[:, 1::2]  # 모든 배치의 홀수 위치 (표준편차)
+
+        if self.training:
+            g_loss = (-torch.log(self._gaussian_dist_pdf(mean, std, frequency_index, gt_lst=gt_lst)) / 2).mean()
+            return (module_input * mean), g_loss
+
+        else: # Validation 
+            return (module_input * mean), [mean, std]#[mean, std]#[(-torch.log(self._gaussian_dist_pdf(mean, std, frequency_index, gt_lst=gt_lst)) / 2).mean()]
+        
+    
+    def _gaussian_dist_pdf(self, data_point, var, freq_idx, gt_lst=None):
+        if gt_lst == None:
+            gt = self.gt_lst[freq_idx]
+        elif isinstance(gt_lst, list):
+            gt = gt_lst[freq_idx]
+        else:
+            gt = gt_lst
+        var = var.clone() + 1e-6
+        pdf_value = torch.exp(- (data_point - gt) ** 2.0 / var / 2.0) / torch.sqrt(2.0 * np.pi * var)
+        return torch.clamp(pdf_value, min=1e-6)
+
 
 class _AtrousSpatialPyramidPoolingModule(nn.Module):
     """
@@ -109,13 +186,35 @@ class DeepV3Plus(nn.Module):
     """
 
     def __init__(self, num_classes, trunk='resnet-101', criterion=None, criterion_aux=None,
-                variant='D', skip='m1', skip_num=48, args=None):
+                variant='D', skip='m1', skip_num=48, is_dwt=0, args=None):
         super(DeepV3Plus, self).__init__()
         self.criterion = criterion
         self.criterion_aux = criterion_aux
         self.variant = variant
         self.args = args
         self.trunk = trunk
+
+        
+        if is_dwt == 2:
+            self.dwt_level = 2
+            self.dwt_kernel_size = 3
+            self.conv1_padding = 1
+            self.is_dwt = True
+        elif is_dwt == 1:
+            self.dwt_level = 1
+            self.dwt_kernel_size = 7
+            self.is_dwt = True
+            self.conv1_padding = 3
+        else:
+            self.dwt_level = 0
+            self.dwt_kernel_size = 0
+            self.is_dwt = False
+            self.conv1_padding = 3
+        
+        if self.is_dwt == True:
+            self.ada_dwt_layer = SEModule(reduction_ = 81)
+
+        self.nll_loss = None
 
         if trunk == 'shufflenetv2':
             channel_1st = 3
@@ -313,7 +412,7 @@ class DeepV3Plus(nn.Module):
                 resnet = Resnet.resnet18(wt_layer=self.args.wt_layer)
                 resnet.layer0 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
             elif trunk == 'resnet-50':
-                resnet = Resnet.resnet50(wt_layer=self.args.wt_layer)
+                resnet = Resnet.resnet50(wt_layer=self.args.wt_layer, is_dwt=is_dwt)
                 resnet.layer0 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool)
             elif trunk == 'resnet-101': # three 3 X 3
                 resnet = Resnet.resnet101(pretrained=True, wt_layer=self.args.wt_layer)
@@ -473,7 +572,41 @@ class DeepV3Plus(nn.Module):
         for index in range(len(self.cov_matrix_layer)):
             self.cov_matrix_layer[index].reset_mask_matrix()
 
+        #Renew    
+    def dwt_rearrange(self, if_map):
+        
+        split_tensor_lst = list()
 
+        if self.dwt_level == 1:
+            tdwt.get_dwt_level1(if_map, split_tensor_lst)
+        elif self.dwt_level == 2:
+            tdwt.get_dwt_level2(if_map, split_tensor_lst)
+        elif self.dwt_level == 3:
+            tdwt.get_dwt_level3(if_map, split_tensor_lst)
+        split_count = len(split_tensor_lst)
+        
+        ### FIX ONLY
+        output_tensor_lst = [self.layer0[0](split_tensor_lst[i]) for i in range(split_count)]
+        for i in range(split_count):
+            output_tensor_lst[i], nll_loss = self.ada_dwt_layer(output_tensor_lst[i],i)
+            if self.training == True:
+                if i == 0:
+                    self.nll_loss = nll_loss
+                else:
+                    self.nll_loss += nll_loss
+            else:
+                if i == 0:
+                    self.nll_loss = nll_loss
+                else:
+                    self.nll_loss.append(nll_loss)
+
+        if self.dwt_level == 1:
+            return tdwt.get_dwt_level1_inverse(output_tensor_lst)
+        elif self.dwt_level == 2:
+            return tdwt.get_dwt_level2_inverse(output_tensor_lst)
+        elif self.dwt_level == 3:
+            return tdwt.get_dwt_level3_inverse(output_tensor_lst)
+        
     def forward(self, x, gts=None, aux_gts=None, img_gt=None, visualize=False, cal_covstat=False, apply_wtloss=True):
         w_arr = []
 
@@ -511,7 +644,13 @@ class DeepV3Plus(nn.Module):
                 x = self.layer0[8](x)
                 x = self.layer0[9](x)
             else:   # Single Input Layer
-                x = self.layer0[0](x)
+                # x = self.layer0[0](x)
+
+                if self.is_dwt:
+                    x = self.dwt_rearrange(x)
+                else:
+                    x = self.layer0[0](x)
+
                 if self.args.wt_layer[2] == 1 or self.args.wt_layer[2] == 2:
                     x, w = self.layer0[1](x)
                     w_arr.append(w)
@@ -625,6 +764,14 @@ def DeepR50V3PlusD(args, num_classes, criterion, criterion_aux):
     print("Model : DeepLabv3+, Backbone : ResNet-50")
     return DeepV3Plus(num_classes, trunk='resnet-50', criterion=criterion, criterion_aux=criterion_aux,
                     variant='D16', skip='m1', args=args)
+
+def DeepR50V3PlusD_DWT(args, num_classes, criterion, criterion_aux):
+    """
+    Resnet 50 Based Network
+    """
+    print("Model : DeepLabv3+, Backbone : ResNet-50")
+    return DeepV3Plus(num_classes, trunk='resnet-50', criterion=criterion, criterion_aux=criterion_aux,
+                    variant='D16', skip='m1', is_dwt=2, args=args)
 
 def DeepR101V3PlusD(args, num_classes, criterion, criterion_aux):
     """

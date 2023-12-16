@@ -397,12 +397,16 @@ class ResNet(nn.Module):
     Resnet Global Module for Initialization
     """
 
-    def __init__(self, block, layers, wt_layer=None, num_classes=1000):
+    def __init__(self, block, layers, wt_layer=None, num_classes=1000, is_dwt=0):
         self.inplanes = 64
         # self.inplanes = 128
         super(ResNet, self).__init__()
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,
-                               bias=False)
+        if is_dwt == 0:
+            self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,bias=False)
+        elif is_dwt == 2:
+            self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1, bias=False)
+        
+
         if wt_layer[2] == 1:
             self.bn1 = InstanceWhitening(64)
             self.relu = nn.ReLU(inplace=False)
